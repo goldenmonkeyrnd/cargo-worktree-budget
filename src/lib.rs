@@ -90,7 +90,7 @@ struct Session {
 struct State {
     format: String,
     root: Identity,
-    build: Option<Identity>,
+    slot: Option<Identity>,
     owner: Option<Owner>,
     running: Option<Session>,
 }
@@ -99,6 +99,7 @@ const FORMAT: &str = "cargo-worktree-budget/v1";
 const STATE: &str = "state.json";
 const NEXT: &str = "state.next";
 const GROUP: &str = "command.stat";
+const SLOT: &str = "slot";
 const BUILD: &str = "build";
 fn control(root: &File, name: &str) -> PathBuf {
     fs::link(root).join(name)
@@ -137,9 +138,9 @@ fn missing(err: &Error) -> bool {
 fn owner_only_contents(root: &File) -> Result<()> {
     for entry in disk::read_dir(fs::link(root))? {
         let name = entry?.file_name();
-        if name == BUILD {
+        if name == SLOT {
             fs::check_mount(
-                &fs::open_dir(&control(root, BUILD))?,
+                &fs::open_dir(&control(root, SLOT))?,
                 Some(fs::directory_mount_id(root)?),
             )?;
         } else if let Some(control_name) = [STATE, NEXT, GROUP]
@@ -196,37 +197,38 @@ impl State {
         let s = Self {
             format: FORMAT.into(),
             root: fs::identity(root)?,
-            build: None,
+            slot: None,
             owner: None,
             running: None,
         };
         s.save(root)?;
         Ok(s)
     }
-    fn build(&self, root: &File) -> Result<File> {
-        let f = fs::open_dir(&control(root, BUILD))?;
-        if self.build.as_ref() != Some(&fs::identity(&f)?) {
-            return reject("managed build directory has been replaced");
+    fn slot(&self, root: &File) -> Result<File> {
+        let f = fs::open_dir(&control(root, SLOT))?;
+        if self.slot.as_ref() != Some(&fs::identity(&f)?) {
+            return reject("registered slot directory has been replaced");
         }
+        fs::private(&f)?;
         fs::check_mount(&f, Some(fs::directory_mount_id(root)?))?;
         Ok(f)
     }
-    fn ensure_build(&mut self, root: &File) -> Result<File> {
-        if self.build.is_some() {
-            return self.build(root);
+    fn ensure_slot(&mut self, root: &File) -> Result<File> {
+        if self.slot.is_some() {
+            return self.slot(root);
         }
-        match DirBuilder::new().mode(0o700).create(control(root, BUILD)) {
+        match DirBuilder::new().mode(0o700).create(control(root, SLOT)) {
             Ok(()) => root.sync_all()?,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
-        let f = fs::open_dir(&control(root, BUILD))?;
+        let f = fs::open_dir(&control(root, SLOT))?;
         fs::check_mount(&f, Some(fs::directory_mount_id(root)?))?;
         fs::private(&f)?;
         if disk::read_dir(fs::link(&f))?.next().is_some() {
-            return reject("refusing to adopt a nonempty unregistered build directory");
+            return reject("refusing to adopt a nonempty unregistered slot directory");
         }
-        self.build = Some(fs::identity(&f)?);
+        self.slot = Some(fs::identity(&f)?);
         self.save(root)?;
         Ok(f)
     }
@@ -243,6 +245,37 @@ impl State {
             );
         }
         process::recorded(&read_control(root, GROUP)?)
+    }
+}
+
+// Cargo clean may delete and recreate the build directory even during a single
+// run. Its registered, private parent is the durable deletion boundary.
+fn build_directory(slot: &File, create: bool) -> Result<Option<File>> {
+    for entry in disk::read_dir(fs::link(slot))? {
+        if entry?.file_name() != BUILD {
+            return reject("unrecognized entry in registered slot directory");
+        }
+    }
+    let path = control(slot, BUILD);
+    if create {
+        match DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => slot.sync_all()?,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let directory = match fs::open_dir(&path) {
+        Err(err) if !create && err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    };
+    fs::check_mount(&directory, Some(fs::directory_mount_id(slot)?))?;
+    Ok(Some(directory))
+}
+
+fn slot_tree(slot: &File, purge: bool) -> Result<u64> {
+    match build_directory(slot, false)? {
+        Some(build) => fs::tree(&build, purge),
+        None => Ok(0),
     }
 }
 
@@ -324,7 +357,7 @@ impl Config {
     fn command(&self, args: &[OsString]) -> Result<std::process::Command> {
         let mut cmd = process::command(args)?;
         cmd.env("CARGO_TARGET_DIR", &self.target_dir)
-            .env("CARGO_BUILD_BUILD_DIR", self.root.join(BUILD))
+            .env("CARGO_BUILD_BUILD_DIR", self.root.join(SLOT).join(BUILD))
             .env_remove("CARGO_BUILD_TARGET_DIR");
         Ok(cmd)
     }
@@ -349,7 +382,7 @@ impl Config {
         if !process::is_nested(group)? {
             return reject("nested caller is outside the owning command group");
         }
-        state.build(root)?;
+        build_directory(&state.slot(root)?, true)?;
         self.reserve(root, &fs::nearest(&self.target_dir)?)?;
         // Nextest and other launchers may have placed the nested wrapper in a
         // child group. Its Cargo command must still belong to the outer watch.
@@ -383,7 +416,6 @@ impl Config {
         }
         process::interrupted()?;
         let mut state = State::initialize(&root)?;
-        let build = state.ensure_build(&root)?;
         if let Some(group) = state.previous_group(&root)? {
             if process::is_nested(group)? {
                 return reject("nested caller lost the owning session environment");
@@ -394,19 +426,22 @@ impl Config {
         if self.validate()?.0 != owner || fs::identity(&self.root(false, mount)?)? != state.root {
             return reject("checkout or pool changed while waiting for the lease");
         }
+        let slot = state.ensure_slot(&root)?;
         let target = fs::nearest(&self.target_dir)?;
+        let retained = slot_tree(&slot, false)?;
         let dirty = state.running.is_some() || state.owner.as_ref() != Some(&owner);
         if dirty
-            || fs::tree(&build, false)? > self.budget_bytes
+            || retained > self.budget_bytes
             || Self::available(&root, &target)? < self.reserve_bytes
         {
             // Invalidate the old owner's warm state before the first deletion.
             state.owner = None;
             state.running = None;
             state.save(&root)?;
-            fs::tree(&build, true)?;
+            slot_tree(&slot, true)?;
         }
         self.reserve(&root, &target)?;
+        build_directory(&slot, true)?;
         let record = match control_file(&root, GROUP, true, true) {
             Ok(f) => f,
             Err(Error::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -440,8 +475,9 @@ impl Config {
         {
             return status;
         }
-        if fs::tree(&build, false)? > self.budget_bytes || status.is_err() {
-            fs::tree(&build, true)?;
+        let slot = state.slot(&root)?;
+        if slot_tree(&slot, false)? > self.budget_bytes || status.is_err() {
+            slot_tree(&slot, true)?;
         }
         state.running = None;
         state.save(&root)?;
@@ -504,17 +540,18 @@ impl Config {
             status.retained_bytes = None;
             return Ok(status);
         }
-        if state.build.is_some() {
-            let build = state.build(&root)?;
+        if state.slot.is_some() {
+            let slot = state.slot(&root)?;
+            status.retained_bytes = Some(slot_tree(&slot, false)?);
             if apply {
                 state.owner = None;
                 state.running = None;
                 state.save(&root)?;
-                fs::tree(&build, true)?;
+                slot_tree(&slot, true)?;
                 status.owner = None;
                 status.recovery_required = false;
+                status.retained_bytes = Some(0);
             }
-            status.retained_bytes = Some(fs::tree(&build, false)?);
         }
         status.available_bytes = Self::available(&root, &fs::nearest(&self.target_dir)?)?;
         Ok(status)

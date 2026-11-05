@@ -15,7 +15,7 @@ cargo-worktree-budget --root "$pool" --owner "$checkout" \
   --target-dir "$checkout/target" run -- cargo build --locked
 ```
 
-The manager sets `CARGO_BUILD_BUILD_DIR` to `$pool/build` and `CARGO_TARGET_DIR` to the requested checkout target. The command inherits its arguments, working directory and standard streams. Its exit code reaches the caller. Keep build scripts and Cargo configuration consistent with these paths. Apply overrides such as coverage-specific child directories only inside the corresponding managed directories.
+The manager sets `CARGO_BUILD_BUILD_DIR` to `$pool/slot/build` and `CARGO_TARGET_DIR` to the requested checkout target. The command inherits its arguments, working directory and standard streams. Its exit code reaches the caller. Keep build scripts and Cargo configuration consistent with these paths. Apply overrides such as coverage-specific child directories only inside the corresponding managed directories.
 
 | Global option | Meaning |
 | --- | --- |
@@ -26,7 +26,7 @@ The manager sets `CARGO_BUILD_BUILD_DIR` to `$pool/build` and `CARGO_TARGET_DIR`
 | `--budget-bytes N` | Retain at most this many allocated bytes of intermediates between commands. Default 64 GiB (68719476736 bytes). |
 | `--reserve-bytes N` | Minimum available bytes on the pool and final-target filesystems. Default 40 GiB (42949672960 bytes). |
 
-The manager refuses symlinks in configured paths. Give it exclusive use of the pool and keep its parent directories under trusted control. Everything placed inside the registered build directory is disposable. The manager checks the identity of that directory and stays within its mount when scanning or deleting files. It unlinks symlinks inside the managed tree without following them. An unexpected file at the top level, a replaced build directory, or unreadable state requires operator inspection.
+The manager refuses symlinks in configured paths. Give it exclusive use of the pool and keep its parent directories under trusted control. The manager records the identity of a private directory at `$pool/slot`. Cargo can remove and recreate its `build` child during `cargo clean`. Everything inside that child is disposable. Before counting or deleting its contents, the manager opens the current child and verifies its mount. It unlinks symlinks inside the managed tree without following them. An unexpected file at the top level, a replaced slot directory, or unreadable state requires operator inspection.
 
 ## Storage and crash recovery
 
@@ -44,7 +44,7 @@ cargo-worktree-budget --root "$pool" --owner "$checkout" --target-dir "$checkout
 cargo-worktree-budget --root "$pool" --owner "$checkout" --target-dir "$checkout/target" prune --apply
 ```
 
-`status` and the default `prune` print JSON without creating files or directories. `retained_bytes` is the allocated size of entries inside the build directory, counting each inode once. It is null during active use. `available_bytes` is the lower free-space value across the pool and target filesystems. `prune --apply` clears the idle registered build directory and forgets its owner. An active pool refuses the request.
+`status` and the default `prune` print JSON without creating files or directories. `retained_bytes` is the allocated size of entries inside the build directory, counting each inode once. It is null during active use. `available_bytes` is the lower free-space value across the pool and target filesystems. `prune --apply` clears the idle slot’s build directory and forgets its owner. An active pool refuses the request.
 
 Rust callers can construct `cargo_worktree_budget::Config` and call `run`, `status` or `prune`. The CLI installs termination-signal forwarding via `forward_signals`; embedding applications choose their own process-wide signal policy.
 

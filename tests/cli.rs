@@ -100,7 +100,7 @@ fn soft_budget_and_reserve() {
         .output()
         .unwrap();
     ok(out);
-    assert!(!f.path("pool/build/blob").exists());
+    assert!(!f.path("pool/slot/build/blob").exists());
     let mut c = Command::new(BIN);
     let out = c
         .arg("--root")
@@ -127,10 +127,10 @@ fn symlink_inside_build_is_never_followed() {
     let f = Fixture::new();
     fs::write(f.path("one/valuable"), "keep").unwrap();
     ok(f.run("one", "true"));
-    symlink(f.path("one"), f.path("pool/build/link")).unwrap();
+    symlink(f.path("one"), f.path("pool/slot/build/link")).unwrap();
     ok(f.run("two", "true"));
     assert!(f.path("one/valuable").exists());
-    assert!(!f.path("pool/build/link").exists());
+    assert!(!f.path("pool/slot/build/link").exists());
 }
 fn cargo(f: &Fixture, owner: &str, verb: &str) -> Output {
     f.manager(owner)
@@ -157,7 +157,7 @@ fn expect_witness(f: &Fixture, owner: &str, value: &str) {
         format!("{value}\n").as_bytes()
     );
     assert!(!f.path(owner).join("target/debug/.fingerprint").exists());
-    let fingerprints = f.path("pool/build/debug/.fingerprint");
+    let fingerprints = f.path("pool/slot/build/debug/.fingerprint");
     assert!(fs::read_dir(fingerprints).unwrap().any(|entry| {
         entry
             .unwrap()
@@ -282,7 +282,7 @@ fn authentic_nested_commands_and_forged_tokens() {
     assert!(!f.path("forged").exists());
 }
 #[test]
-fn preserve_replaced_build_directory_and_reject_unmounted_path() {
+fn preserve_replaced_slot_directory_and_reject_unmounted_path() {
     let f = Fixture::new();
     assert!(
         !f.manager("one")
@@ -296,9 +296,9 @@ fn preserve_replaced_build_directory_and_reject_unmounted_path() {
     );
     assert!(!f.path("pool").exists());
     ok(f.run("one", "true"));
-    fs::rename(f.path("pool/build"), f.path("displaced")).unwrap();
-    fs::create_dir(f.path("pool/build")).unwrap();
-    fs::write(f.path("pool/build/foreign"), "save").unwrap();
+    fs::rename(f.path("pool/slot"), f.path("displaced")).unwrap();
+    fs::create_dir(f.path("pool/slot")).unwrap();
+    fs::write(f.path("pool/slot/foreign"), "save").unwrap();
     assert!(
         !f.manager("one")
             .args(["prune", "--apply"])
@@ -307,7 +307,7 @@ fn preserve_replaced_build_directory_and_reject_unmounted_path() {
             .status
             .success()
     );
-    assert!(f.path("pool/build/foreign").exists());
+    assert!(f.path("pool/slot/foreign").exists());
 }
 #[test]
 fn live_reserve_terminates_owned_grandchildren_only() {
@@ -350,7 +350,7 @@ fn live_reserve_terminates_owned_grandchildren_only() {
     independent.wait().unwrap();
     assert!(f.path("started").exists());
     assert!(!result.success());
-    assert!(!f.path("pool/build/blob").exists());
+    assert!(!f.path("pool/slot/build/blob").exists());
     assert!(!f.path("escaped").exists());
 }
 
@@ -412,6 +412,14 @@ fn bind_mounted_control_files_are_never_modified() {
             test "$(cat "$BASE/sentinel")" = 'valuable external contents' || exit 14
             umount "$BASE/pool/$control"
         done
+        mkdir "$BASE/external"
+        echo outside > "$BASE/external/valuable"
+        mount --bind "$BASE/external" "$BASE/pool/slot/build"
+        ! manager run -- true || exit 21
+        ! manager status || exit 22
+        ! manager prune --apply || exit 23
+        test "$(cat "$BASE/external/valuable")" = outside || exit 24
+        umount "$BASE/pool/slot/build"
     "#;
     ok(Command::new("unshare")
         .env("BIN", BIN)
@@ -460,4 +468,68 @@ fn orphan_reentry_without_token_refuses_to_drain_itself() {
     );
     assert!(!f.path("should-not-run").exists());
     ok(f.run("two", "true"));
+}
+
+#[test]
+fn cargo_clean_and_build_recreate_intermediates() {
+    let f = Fixture::new();
+    let ws = f.path("one");
+    fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname='witness'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::create_dir(ws.join("src")).unwrap();
+    fs::write(ws.join("src/main.rs"), "fn main(){println!(\"AAAA\");}").unwrap();
+    ok(cargo(&f, "one", "build"));
+    ok(cargo(&f, "one", "clean"));
+    ok(cargo(&f, "one", "build"));
+    expect_witness(&f, "one", "AAAA");
+
+    // Both Cargo commands execute inside one lease; accounting must reopen the
+    // Cargo-managed child after the clean recreates its directory identity.
+    let combined = r#""$CARGO" clean --offline && "$CARGO" build --offline"#;
+    let before = f.manager("one").arg("status").output().unwrap();
+    let count = |o: Output| -> u64 {
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["retained_bytes"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(count(before) > 0);
+    ok(f.manager("one")
+        .current_dir(&ws)
+        .args(["--budget-bytes", "1", "run", "--", "sh", "-ec", combined])
+        .output()
+        .unwrap());
+    assert_eq!(count(f.manager("one").arg("status").output().unwrap()), 0);
+    assert!(!f.path("pool/slot/build/debug/.fingerprint").exists());
+    assert_eq!(
+        Command::new(ws.join("target/debug/witness"))
+            .output()
+            .unwrap()
+            .stdout,
+        b"AAAA\n"
+    );
+    assert!(ws.join("target/debug/witness").is_file());
+}
+
+#[test]
+fn refuse_symlink_in_place_of_disposable_build_directory() {
+    let f = Fixture::new();
+    ok(f.run("one", "true"));
+    let build = f.path("pool/slot/build");
+    fs::remove_dir(&build).unwrap();
+    let foreign = f.path("two");
+    fs::write(foreign.join("valuable"), "external").unwrap();
+    symlink(&foreign, &build).unwrap();
+    assert!(!f.run("two", "true").status.success());
+    assert!(
+        !f.manager("one")
+            .args(["prune", "--apply"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(foreign.join("valuable")).unwrap(), b"external");
 }
