@@ -112,6 +112,7 @@ fn control_file(root: &File, name: &str, write: bool, create: bool) -> Result<Fi
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(control(root, name))?;
+    fs::check_mount(&file, Some(fs::directory_mount_id(root)?))?;
     let m = file.metadata()?;
     if !m.is_file() || m.nlink() != 1 || m.uid() != root.metadata()?.uid() || m.mode() & 0o077 != 0
     {
@@ -136,10 +137,17 @@ fn missing(err: &Error) -> bool {
 fn owner_only_contents(root: &File) -> Result<()> {
     for entry in disk::read_dir(fs::link(root))? {
         let name = entry?.file_name();
-        if ![STATE, NEXT, GROUP, BUILD]
-            .iter()
-            .any(|allowed| name == *allowed)
+        if name == BUILD {
+            fs::check_mount(
+                &fs::open_dir(&control(root, BUILD))?,
+                Some(fs::directory_mount_id(root)?),
+            )?;
+        } else if let Some(control_name) = [STATE, NEXT, GROUP]
+            .into_iter()
+            .find(|allowed| name == *allowed)
         {
+            control_file(root, control_name, false, false)?;
+        } else {
             return reject(format!(
                 "unrecognized entry in managed root: {}",
                 name.to_string_lossy()
@@ -343,8 +351,11 @@ impl Config {
         }
         state.build(root)?;
         self.reserve(root, &fs::nearest(&self.target_dir)?)?;
-        // Leave nested children in the outer group so one watchdog owns them all.
-        Ok(self.command(args)?.status()?)
+        // Nextest and other launchers may have placed the nested wrapper in a
+        // child group. Its Cargo command must still belong to the outer watch.
+        let mut cmd = self.command(args)?;
+        group.join(&mut cmd);
+        Ok(cmd.status()?)
     }
 
     /// Queue for exclusive access, run a command and enforce the retention policy.
@@ -355,8 +366,13 @@ impl Config {
         if let Some(token) = token {
             return self.nested(&root, &owner, token.to_str().unwrap_or(""), args);
         }
+        let pid_namespace = disk::metadata("/proc/self/ns/pid")?.ino();
         while !fs::lock(&root, false)? {
             if let Ok(state) = State::load(&root)
+                && state
+                    .running
+                    .as_ref()
+                    .is_some_and(|s| s.pid_namespace == pid_namespace)
                 && let Some(group) = state.previous_group(&root)?
                 && process::is_nested(group)?
             {
@@ -369,6 +385,9 @@ impl Config {
         let mut state = State::initialize(&root)?;
         let build = state.ensure_build(&root)?;
         if let Some(group) = state.previous_group(&root)? {
+            if process::is_nested(group)? {
+                return reject("nested caller lost the owning session environment");
+            }
             process::drain(group)?;
         }
         // A queued checkout can have been replaced while another run held the lock.
@@ -402,7 +421,7 @@ impl Config {
         state.running = Some(Session {
             token: token.clone(),
             boot: boot()?,
-            pid_namespace: disk::metadata("/proc/self/ns/pid")?.ino(),
+            pid_namespace,
             budget: self.budget_bytes,
             reserve: self.reserve_bytes,
         });
@@ -451,6 +470,11 @@ impl Config {
         if !idle {
             if apply {
                 return reject("pool is active; prune refused");
+            }
+            if let Ok(state) = State::load(&root) {
+                status.owner = state
+                    .owner
+                    .map(|o| String::from_utf8_lossy(&o.path).into_owned());
             }
             status.initialized = true;
             status.active = true;

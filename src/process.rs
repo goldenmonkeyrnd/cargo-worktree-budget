@@ -20,6 +20,12 @@ pub(crate) struct Process {
     zombie: bool,
 }
 
+impl Process {
+    pub(crate) fn join(&self, cmd: &mut Command) {
+        cmd.process_group(self.group);
+    }
+}
+
 fn parse(raw: &str) -> Option<Process> {
     let (id, fields) = raw.rsplit_once(')')?;
     let pid = id.split_once(' ')?.0.parse().ok()?;

@@ -132,11 +132,44 @@ fn symlink_inside_build_is_never_followed() {
     assert!(f.path("one/valuable").exists());
     assert!(!f.path("pool/build/link").exists());
 }
+fn cargo(f: &Fixture, owner: &str, verb: &str) -> Output {
+    f.manager(owner)
+        .args(["run", "--"])
+        .arg(std::env::var_os("CARGO").unwrap())
+        .args([verb, "--offline"])
+        .current_dir(f.path(owner))
+        .output()
+        .unwrap()
+}
+
+fn make_older(file: &Path) {
+    ok(Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(file)
+        .output()
+        .unwrap());
+}
+
+fn expect_witness(f: &Fixture, owner: &str, value: &str) {
+    let binary = f.path(owner).join("target/debug/witness");
+    assert_eq!(
+        Command::new(binary).output().unwrap().stdout,
+        format!("{value}\n").as_bytes()
+    );
+    assert!(!f.path(owner).join("target/debug/.fingerprint").exists());
+    let fingerprints = f.path("pool/build/debug/.fingerprint");
+    assert!(fs::read_dir(fingerprints).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("witness-")
+    }));
+}
+
 #[test]
 fn cargo_rebuilds_divergent_older_sources() {
     let f = Fixture::new();
-    let cargo = std::env::var_os("CARGO").unwrap();
-    let mut older = false;
     for (owner, value) in [("one", "AAAA"), ("two", "BBBB")] {
         let ws = f.path(owner);
         fs::create_dir(ws.join("src")).unwrap();
@@ -145,34 +178,34 @@ fn cargo_rebuilds_divergent_older_sources() {
             "[package]\nname='witness'\nversion='0.1.0'\nedition='2021'\n",
         )
         .unwrap();
-        fs::write(
-            ws.join("src/main.rs"),
-            format!("fn main() {{ println!(\"{value}\"); }}"),
-        )
-        .unwrap();
-        if older {
-            ok(Command::new("touch")
-                .args(["-t", "200001010000"])
-                .arg(ws.join("src/main.rs"))
-                .output()
-                .unwrap());
+        fs::write(ws.join("src/main.rs"),format!(r#"fn main() {{ println!("{value}"); }}
+#[test] fn checkout_behavior() {{ assert_eq!("{value}", "AAAA", "branch test must fail for BBBB"); }}"#)).unwrap();
+        if owner == "two" {
+            make_older(&ws.join("src/main.rs"));
         }
-        ok(f.manager(owner)
-            .args(["run", "--"])
-            .arg(&cargo)
-            .args(["build", "--offline"])
-            .current_dir(&ws)
-            .output()
-            .unwrap());
-        assert_eq!(
-            Command::new(ws.join(Path::new("target/debug/witness")))
-                .output()
-                .unwrap()
-                .stdout,
-            format!("{value}\n").as_bytes()
-        );
-        older = true;
     }
+    ok(cargo(&f, "one", "build"));
+    ok(cargo(&f, "one", "test"));
+    expect_witness(&f, "one", "AAAA");
+    ok(cargo(&f, "two", "build"));
+    expect_witness(&f, "two", "BBBB");
+    let failed = cargo(&f, "two", "test");
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("branch test must fail for BBBB"));
+    ok(cargo(&f, "one", "build"));
+    ok(cargo(&f, "one", "test"));
+    expect_witness(&f, "one", "AAAA");
+    let bad = f.path("two/src/main.rs");
+    fs::write(
+        &bad,
+        "compile_error!(\"invalid older checkout source\"); fn main() {}",
+    )
+    .unwrap();
+    make_older(&bad);
+    let invalid = cargo(&f, "two", "build");
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid older checkout source"));
+    expect_witness(&f, "one", "AAAA");
 }
 
 fn wait_file(path: &Path) {
@@ -349,4 +382,82 @@ fn pool_mount_does_not_relocate_checkout_outputs() {
         .args(["--reserve-bytes", "0", "run", "--", "true"]);
     ok(cmd.output().unwrap());
     assert!(!target.exists());
+}
+
+#[test]
+fn bind_mounted_control_files_are_never_modified() {
+    if !Command::new("unshare")
+        .args(["-rm", "true"])
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        eprintln!("mount namespace unavailable; skipping bind-mount witness");
+        return;
+    }
+    let f = Fixture::new();
+    ok(f.run("one", "true"));
+    fs::write(f.path("sentinel"), "valuable external contents").unwrap();
+    fs::set_permissions(f.path("sentinel"), fs::Permissions::from_mode(0o600)).unwrap();
+    let witness = r#"
+        manager() {
+            "$BIN" --root "$BASE/pool" --owner "$BASE/one" \
+                --target-dir "$BASE/one/target" --reserve-bytes 0 "$@"
+        }
+        for control in command.stat state.json state.next; do
+            if [ "$control" = state.next ]; then install -m 600 /dev/null "$BASE/pool/$control"; fi
+            mount --bind "$BASE/sentinel" "$BASE/pool/$control"
+            ! manager run -- true || exit 11
+            ! manager status || exit 12
+            ! manager prune --apply || exit 13
+            test "$(cat "$BASE/sentinel")" = 'valuable external contents' || exit 14
+            umount "$BASE/pool/$control"
+        done
+    "#;
+    ok(Command::new("unshare")
+        .env("BIN", BIN)
+        .env("BASE", &f.0)
+        .args(["-rm", "sh", "-ec", witness])
+        .output()
+        .unwrap());
+}
+
+#[test]
+fn orphan_reentry_without_token_refuses_to_drain_itself() {
+    let f = Fixture::new();
+    let script = r#"
+        touch ready
+        while [ ! -e killed ]; do sleep 0.02; done
+        result=0
+        timeout 2 env -u CARGO_WORKTREE_BUDGET_SESSION \
+            "$BIN" --root "$BASE/pool" --owner "$BASE/one" --target-dir "$BASE/one/target" \
+            --reserve-bytes 0 run -- touch should-not-run 2>diagnostic || result=$?
+        echo "$result" >result
+    "#;
+    let mut first = f
+        .manager("one")
+        .env("BIN", BIN)
+        .env("BASE", &f.0)
+        .current_dir(&f.0)
+        .args(["run", "--", "sh", "-ec", script])
+        .spawn()
+        .unwrap();
+    wait_file(&f.path("ready"));
+    first.kill().unwrap();
+    first.wait().unwrap();
+    fs::write(f.path("killed"), "").unwrap();
+    wait_file(&f.path("result"));
+    let result = fs::read_to_string(f.path("result")).unwrap();
+    assert_eq!(
+        result.trim(),
+        "1",
+        "{}",
+        fs::read_to_string(f.path("diagnostic")).unwrap()
+    );
+    assert!(
+        fs::read_to_string(f.path("diagnostic"))
+            .unwrap()
+            .contains("lost the owning session")
+    );
+    assert!(!f.path("should-not-run").exists());
+    ok(f.run("two", "true"));
 }
